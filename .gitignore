@@ -1,0 +1,14 @@
+# Local databases and logs
+*.log
+pgdata/
+data/
+
+# Environment and secrets
+.env
+.env.*
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
