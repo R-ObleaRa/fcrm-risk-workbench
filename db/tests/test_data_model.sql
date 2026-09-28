@@ -100,6 +100,11 @@ declare
     v_clause  uuid;
     v_chal    uuid;
     v_chal2   uuid;
+    v_cons    uuid;
+    v_rev     uuid;
+    v_av2     uuid;
+    v_rf3     uuid;
+    v_ev2     uuid;
     v_review  uuid;
     v_dec     uuid;
     v_cfg     uuid := gen_random_uuid();
@@ -373,7 +378,11 @@ begin
     perform pg_temp.expect_error(format(
         'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''no_change_required'', ''Nothing to change here'')',
         (select id from core.challenge_consequence where challenge_id = v_chal and consequence_kind = 'correct_subject')),
-        'must be superseded by a new record');
+        'must be corrected (superseded_by_new_record)');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''amended_in_draft'', ''Edited the rating in place'')',
+        (select id from core.challenge_consequence where challenge_id = v_chal and consequence_kind = 'correct_subject')),
+        'cannot be amended or withdrawn in a draft');
 
     insert into core.rating (assessment_version_id, rating_kind, method, rating_level_term_id, config_version_id,
                              overrides_rating_id, override_justification, challenge_id)
@@ -432,6 +441,47 @@ begin
     insert into core.consequence_disposition (consequence_id, action, note)
     select id, 'no_change_required', 'Challenge dismissed; field stands'
       from core.challenge_consequence where challenge_id = v_chal2;
+
+    -- Upheld challenge of an extracted field: corrected by a human review, not a superseding record.
+    perform set_config('fcrm.actor_id', 'user:analyst.alice@fcrm.example', true);
+    insert into core.challenge (subject_table, subject_id, challenged_aspect, reason, proposed_value)
+    values ('core.extracted_field', v_field, 'value', 'Specification v1 page 2 also lists MY as a launch corridor.', '{"value": "SG, HK, MY"}')
+    returning id into v_chal2;
+    perform set_config('fcrm.actor_id', 'user:mlro.maria@fcrm.example', true);
+    insert into core.challenge_resolution (challenge_id, outcome, rationale)
+    values (v_chal2, 'upheld', 'MY is listed as a launch corridor in the synthetic specification.');
+
+    perform set_config('fcrm.actor_id', 'user:analyst.alice@fcrm.example', true);
+    select id into v_cons from core.challenge_consequence where challenge_id = v_chal2 and consequence_kind = 'correct_subject';
+    perform pg_temp.assert((select target_snapshot ->> 'value_text' = 'SG, HK' from core.challenge_consequence where id = v_cons),
+        'consequence preserves the disputed state of its target');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''no_change_required'', ''Nothing to change here'')', v_cons),
+        'corrected_by_review or superseded_by_new_record');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, resulting_table, resulting_id, note) values (%L, ''superseded_by_new_record'', ''core.rating'', %L, ''Wrong kind of record'')',
+        v_cons, v_res2),
+        'superseded by a core.extracted_field row');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''withdrawn_in_draft'', ''Cannot withdraw'')', v_cons),
+        'cannot be amended or withdrawn in a draft');
+
+    insert into core.extracted_field_review (extracted_field_id, outcome) values (v_field, 'confirmed') returning id into v_rev;
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, resulting_table, resulting_id, note) values (%L, ''corrected_by_review'', ''core.extracted_field_review'', %L, ''Reconfirmed value'')',
+        v_cons, v_rev),
+        'does not correct it');
+    insert into core.extracted_field_review (extracted_field_id, outcome, corrected_value_text)
+    values (v_field, 'corrected', 'SG, HK, MY') returning id into v_rev;
+    insert into core.consequence_disposition (consequence_id, action, resulting_table, resulting_id, note)
+    values (v_cons, 'corrected_by_review', 'core.extracted_field_review', v_rev, 'Reviewer corrected the corridor list');
+    perform pg_temp.assert(
+        (select effective_value_text = 'SG, HK, MY' from core.extracted_field_current where extracted_field_id = v_field),
+        'upheld extracted-field challenge closed by a corrective review');
+    -- Dependents are on the active assessment version; a reassessment would carry the corridor change.
+    insert into core.consequence_disposition (consequence_id, action, note)
+    select id, 'no_change_required', 'Carried into the next assessment version'
+      from core.challenge_consequence where challenge_id = v_chal2 and consequence_kind <> 'correct_subject';
 
     perform pg_temp.assert(
         (select count(*) = 0 from core.open_challenge_item where assessment_version_id = v_av1),
@@ -510,6 +560,58 @@ begin
             and bool_or(consequence_kind = 'recalculate_dependent' and target_id = v_res2)
            from core.challenge_consequence where challenge_id = v_chal),
         'post-decision challenge flags the dependent residual and the decision');
+
+    -- Upheld challenges of rows in a draft assessment version: amended or withdrawn in place.
+    insert into core.assessment_version (assessment_id, change_request_id, change_request_version_id, analyst_id, config_version_id)
+    values (v_asmt, v_cr, v_crv1, 'user:analyst.alice@fcrm.example', v_cfg)
+    returning id into v_av2;
+    insert into core.risk_factor (assessment_version_id, category_term_id, factor_code, response, factor_score, origin)
+    values (v_av2, ref.term_id('RISK_FACTOR_CATEGORY', 'CHANNEL_NON_FACE_TO_FACE'), 'NON_FACE_TO_FACE', 'true', 2.0, 'system_derived')
+    returning id into v_rf3;
+    insert into core.evidence_link (assessment_version_id, risk_factor_id, document_version_id, note)
+    values (v_av2, v_rf3, v_docv, 'Onboarding flow screenshots') returning id into v_ev2;
+
+    insert into core.challenge (subject_table, subject_id, challenged_aspect, reason)
+    values ('core.risk_factor', v_rf3, 'factor_score', 'Onboarding uses certified digital identity, which mitigates non-face-to-face risk.')
+    returning id into v_chal;
+    insert into core.challenge (subject_table, subject_id, challenged_aspect, reason)
+    values ('core.evidence_link', v_ev2, 'relevance', 'The screenshots show the legacy flow, not the channel being launched.')
+    returning id into v_chal2;
+    perform set_config('fcrm.actor_id', 'user:mlro.maria@fcrm.example', true);
+    insert into core.challenge_resolution (challenge_id, outcome, rationale)
+    values (v_chal, 'partially_upheld', 'Digital identity is certified; the score should drop but not to the minimum.'),
+           (v_chal2, 'upheld', 'The evidence is for the wrong flow and does not support the factor.');
+
+    perform set_config('fcrm.actor_id', 'user:analyst.alice@fcrm.example', true);
+    select id into v_cons from core.challenge_consequence where challenge_id = v_chal and consequence_kind = 'correct_subject';
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''no_change_required'', ''Nothing to change here'')', v_cons),
+        'amended_in_draft, withdrawn_in_draft or superseded_by_new_record');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''amended_in_draft'', ''Claimed but not done'')', v_cons),
+        'has not been amended since the challenge');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''withdrawn_in_draft'', ''Claimed but not done'')', v_cons),
+        'still exists');
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, resulting_table, resulting_id, note) values (%L, ''corrected_by_review'', ''core.extracted_field_review'', %L, ''Wrong mechanism'')',
+        v_cons, v_rev),
+        'are not corrected by review');
+
+    update core.risk_factor set factor_score = 1.5, rationale = 'Certified digital identity at onboarding' where id = v_rf3;
+    insert into core.consequence_disposition (consequence_id, action, note)
+    values (v_cons, 'amended_in_draft', 'Score lowered in the draft assessment');
+
+    select id into v_cons from core.challenge_consequence where challenge_id = v_chal2 and consequence_kind = 'correct_subject';
+    delete from core.evidence_link where id = v_ev2;
+    perform pg_temp.expect_error(format(
+        'insert into core.consequence_disposition (consequence_id, action, note) values (%L, ''amended_in_draft'', ''Not amended, removed'')', v_cons),
+        'disposition it as withdrawn_in_draft');
+    insert into core.consequence_disposition (consequence_id, action, note)
+    values (v_cons, 'withdrawn_in_draft', 'Irrelevant evidence removed from the draft');
+    perform pg_temp.assert(
+        (select count(*) = 0 from core.open_challenge_item where assessment_version_id = v_av2),
+        'upheld challenges of draft rows closed by amendment and withdrawal');
 
     ---------------------------------------------------------------------------
     -- Lineage

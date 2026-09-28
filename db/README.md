@@ -11,6 +11,7 @@ PostgreSQL 16 schema for the FCRM Risk Assessment Workbench. The migrations use 
 | `V005__ratings_and_decisions.sql` | Ratings with explanation trace and mitigation rules, committee reviews, votes, decisions, conditions |
 | `V006__seed_reference_taxonomies.sql` | Published frameworks and version 1 of the thirteen reference taxonomies |
 | `V007__human_challenge_and_consequences.sql` | Human challenge of system outputs, consequence tracking, committee gates |
+| `V008__immutable_audit_ledger.sql` | Append-only, hash-chained audit event ledger used by every component |
 
 ## Design constraints and how they are enforced
 
@@ -47,7 +48,15 @@ To lower residual risk, a human has to challenge the inherent rating or the cont
 1. **Challenge.** `core.challenge` records the human's disagreement with any row in a table registered in `core.challengeable_table`: ratings, rating inputs, risk factors, control evaluations, evidence links and extracted fields. It needs a reason of at least 20 characters and must come from a human (`origin = user_entry`).
 2. **Consequences.** `core.challenge_consequence` is generated automatically. It covers the subject itself, the ratings in effect that were derived from it (through rating inputs and basis chains), evidence built on it, records derived from it in the lineage graph, and any decision already taken on an affected assessment.
 3. **Resolution.** `core.challenge_resolution` upholds or dismisses the challenge. It must be made by someone other than the challenger (four-eyes, Wolfsberg 6.2.1).
-4. **Disposition.** `core.consequence_disposition` closes each consequence, either with a later record that supersedes the affected one or as `no_change_required`. If the challenge is upheld, the challenged record itself must be superseded. If it's dismissed, everything closes as `no_change_required`.
+4. **Disposition.** `core.consequence_disposition` closes each consequence. If the challenge is dismissed, everything closes as `no_change_required`. If it's upheld, the challenged record must be corrected in the way `core.challengeable_table.correction_method` sets for its table:
+
+   | Method | Tables | Accepted corrections |
+   |---|---|---|
+   | `new_record` | ratings, rating inputs | `superseded_by_new_record`, meaning a later rating of the same kind |
+   | `review_record` | extracted fields | `corrected_by_review`, meaning the field's latest review, which corrects or rejects it; or `superseded_by_new_record` by a re-extraction |
+   | `draft_amendment` | risk factors, control evaluations, evidence links | `amended_in_draft` or `withdrawn_in_draft` while the assessment version is draft; or `superseded_by_new_record`, e.g. in a new assessment version |
+
+   Every correction is checked. A superseding record must be in the registered table and created after the challenge. A corrective review must review the challenged row. An amendment must differ from `target_snapshot`, the copy of the row taken when the consequence was raised. A withdrawal requires that the row is gone.
 5. **Gates.** While `core.open_challenge_item` has rows for an assessment version, it can't go to committee or be decided. The committee also requires that the residual rating in effect is derived from the inherent rating in effect, so it can't be stale.
 
 A rating override must cite an upheld challenge of the rating it replaces.
@@ -59,11 +68,23 @@ A rating override must cite an upheld challenge of the rating it replaces.
 - **Document storage.** Storage URIs must use the `synthetic://` scheme.
 - **Public reference material.** ISO country codes and published framework citations (including their public URLs) aren't customer or system data. The database only stores the URLs and never connects to them.
 
+### 5. Every change is an append-only, hash-chained audit event
+
+`audit.event` is the ledger every later component writes to. Updates and deletes of business data become new events; nothing in the ledger is changed in place.
+
+- **Row changes.** Every insert, update and delete on a table in a governed schema (`gov`, `ref`, `core`) is captured by trigger: actor, database role, time, the row before and after, the changed columns, the reason and the correlation id. Tables created later in those schemas are enrolled automatically. Column templates (`gov.tmpl_*`) are exempt.
+- **Domain events.** Components record facts that are not row changes with `audit.record_event('workflow.transitioned', '{"from":"draft","to":"submitted"}', 'core.change_request', id, 'reason')`. Event types under `audit.` are reserved for the ledger itself.
+- **Sealing.** Captured events wait in `audit.pending_event` until the transaction commits. A deferred trigger then appends them to `audit.event` in capture order, each with the next gapless `seq` and `event_hash = sha256` of its canonical form (`fcrm-audit-v1`), which includes the previous event's hash. A rolled-back transaction leaves no events.
+- **Tamper evidence.** `audit.event` rejects `UPDATE`, `DELETE` and `TRUNCATE`, and accepts an `INSERT` only from the sealer. `audit.verify_chain()` recomputes every hash and link. `audit.take_anchor()` records the chain head; copy the result outside the database so a rewrite of the whole chain is still detectable. Ledger triggers are `ENABLE ALWAYS`, so `session_replication_role = replica` does not bypass capture or immutability. Event triggers enrol new tables and reject DDL that would drop, disable or weaken capture or protection.
+- **Coverage.** `audit.coverage` lists every governed or enrolled table. `audit.coverage_gap` and `audit.assert_coverage()` report anything that would let a change escape the ledger. Rows that existed before V008 are recorded as `row_baseline` events so the trail is complete from the first record.
+- **Read path.** `audit.row_history(table, id)` and `audit.events_for(correlation_id)` return sealed events oldest-first. Application roles need no write privileges on ledger tables: capture, sealing and `record_event` run as the ledger owner. Read grants for analysts and examiners come with the identity module (step 3).
+
 ## Schemas
 
 - `gov`: governance infrastructure shared by every table
 - `ref`: frameworks and controlled reference taxonomies
 - `core`: FCRM domain data
+- `audit`: immutable hash-chained event ledger written to by every component
 
 ## Record kinds
 
@@ -109,6 +130,13 @@ commit;
 
 If it isn't set, writes fail the `NOT NULL` check on `created_by`. A non-synthetic identity fails `ck_synthetic_principal`.
 
+Optional session settings consumed by the audit ledger (also `SET LOCAL` per transaction):
+
+```sql
+set local fcrm.change_reason  = 'Product owner submitted the request';
+set local fcrm.correlation_id = '11111111-1111-1111-1111-111111111111';
+```
+
 ## Traceability rules enforced in the database
 
 - **Reference by exact version.** Business rows point at a specific taxonomy term row, so the taxonomy version in force is pinned. `ref.check_term_refs` verifies that each term belongs to the expected taxonomy and to its active version.
@@ -145,14 +173,16 @@ Enums are used only for values that application logic depends on: vote choices, 
 - `config_version_id` (on `core.assessment_version` and `core.rating`) and `intake_form_version_id` (on `core.change_request_version`) will reference the configuration store from step 3. That migration adds the foreign keys.
 - Principal ids are synthetic identities in the `gov.principal_id` domain. Step 3 can add foreign keys to its user table.
 - AI suggestions (step 7) should register their table in `core.challengeable_table` so humans can challenge them.
-- `correlation_id` links rows to audit-ledger events (step 2) and AI suggestion events (step 7).
+- `correlation_id` on a row and on `audit.event` is the same workflow instance. Set `fcrm.correlation_id` in the session so every captured change and `audit.record_event()` call in the transaction carries it. Look up with `audit.events_for(correlation_id)` and `audit.row_history(table, id)`.
+- Later components record non-row facts (workflow transitions, AI suggestions, examiner exports) with `audit.record_event()`. Row changes in `gov`, `ref` and `core` are captured automatically.
 
 ## Running locally
 
 ```powershell
 createdb fcrm
 Get-ChildItem db\migrations\V*.sql | Sort-Object Name | ForEach-Object { psql -d fcrm -v ON_ERROR_STOP=1 -1 -f $_.FullName }
-psql -d fcrm -f db\tests\test_data_model.sql
+psql -d fcrm -v ON_ERROR_STOP=1 -f db\tests\test_data_model.sql
+psql -d fcrm -v ON_ERROR_STOP=1 -f db\tests\test_audit_ledger.sql
 ```
 
-The test script runs inside a transaction that is rolled back, so it leaves no data behind.
+The test scripts run inside a transaction that is rolled back, so they leave no data behind. `V008` creates event triggers and must be applied by a superuser (`rds_superuser` on RDS).
