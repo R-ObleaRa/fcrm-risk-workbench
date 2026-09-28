@@ -24,6 +24,23 @@ Governed FCRM Risk Assessment Workbench. Foundations first, then UI. There is no
 
 Release 1 is steps 1–5 (usable workbench, no AI). Release 2 is 6–7. Release 3 is 8–9.
 
+## Continue in Cursor
+
+This chat and the original Cursor plan stay on the author's machine. The repo is the shared source of truth.
+
+1. Clone [fcrm-risk-workbench](https://github.com/R-ObleaRa/fcrm-risk-workbench) (you need collaborator access).
+2. **File → Open Folder** on that clone.
+3. Open **Agent** chat (`Ctrl+L`). Attach this file with `@HANDOFF.md`.
+4. Paste the prompt below. Change only the to-do id if you are not on the next pending step.
+
+```
+Read HANDOFF.md and db/README.md. Implement the next to-do: config-rbac — roles (Product Owner, FCRM Analyst, Committee Member, Examiner) and versioned maker-checker configuration for scoring weights, questionnaires, and workflow rules. Follow the existing PostgreSQL migration style (next unused V###). Do not skip ahead to workflow or AI. After you finish, update the Done / Next tables in HANDOFF.md.
+```
+
+5. When the step is done: commit, push, and leave `HANDOFF.md` updated so the next person can repeat from step 3.
+
+There is no web UI or `npm start` until `workflow` (step 4). Until then, verify with the `psql` commands below.
+
 ## How to run the database
 
 PostgreSQL 16. `V008` needs a superuser (`rds_superuser` on RDS) because it creates event triggers.
